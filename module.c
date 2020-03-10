@@ -279,17 +279,18 @@ static void soft_uart_set_termios(struct tty_struct* tty, struct ktermios* termi
     printk(KERN_ALERT "soft_uart: Invalid number of data bits.\n");
   }
   
-  // Verifies the number of stop bits (it must be 1).
+  // Configure stop bits (1 or 2)
   if (cflag & CSTOPB)
   {
-    printk(KERN_ALERT "soft_uart: Invalid number of stop bits.\n");
+    raspberry_soft_uart_set_stop_bits(2);
   }
-  
-  // Verifies the parity (it must be none).
-  if (cflag & PARENB)
+  else
   {
-    printk(KERN_ALERT "soft_uart: Invalid parity.\n");
+    raspberry_soft_uart_set_stop_bits(1);
   }
+
+  // Configures parity (enabled or disabled, even or odd, parity errors ignored or not).
+  raspberry_soft_uart_set_parity(cflag & PARENB, cflag & PARODD, cflag & IGNPAR);
   
   // Configure the baudrate.
   if (!raspberry_soft_uart_set_baudrate(baudrate))
