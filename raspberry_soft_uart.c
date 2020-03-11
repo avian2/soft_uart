@@ -26,6 +26,13 @@ static int gpio_tx = 0;
 static int gpio_rx = 0;
 static int rx_bit_index = -1;
 static void (*rx_callback)(unsigned char) = NULL;
+static int stop_bits = 1;
+static int parity_en = 0;
+static int ignore_parity_errors = 0;
+
+static int parity_init = 0;
+static int final_stop_bit_index = 8;
+static int parity_index = -1;
 
 /**
  * Initializes the Raspberry Soft UART infrastructure.
@@ -132,6 +139,57 @@ int raspberry_soft_uart_set_baudrate(const int baudrate)
   return 1;
 }
 
+static void recalc_indices(void)
+{
+  if (parity_en)
+  {
+    parity_index = 8;
+    final_stop_bit_index = parity_index + stop_bits;
+  }
+  else
+  {
+    parity_index = -1;
+    final_stop_bit_index = 7 + stop_bits;
+  }
+}
+
+
+/**
+ * Sets the number of stop bits.
+ * @param _stop_bits number of stop bits (1 or 2)
+ * @return 1 if the operation is successful. 0 otherwise.
+ */
+int raspberry_soft_uart_set_stop_bits(int _stop_bits)
+{
+  stop_bits = _stop_bits;
+  recalc_indices();
+  return 1;
+}
+
+/**
+ * Enables or disables parity bit.
+ * @param _parity_en 1 to enable, 0 to disable.
+ * @param parity_odd 1 for odd parity, 0 for even parity
+ * @param _ignore_parity_errors 1 to receive characters with wrong parity bit, 0 to drop them.
+ * @return 1 if the operation is successful. 0 otherwise.
+ */
+int raspberry_soft_uart_set_parity(int _parity_en, int parity_odd, int _ignore_parity_errors)
+{
+  parity_en = _parity_en;
+  if (parity_odd)
+  {
+    parity_init = 1;
+  }
+  else
+  {
+    parity_init = 0;
+  }
+  ignore_parity_errors = _ignore_parity_errors;
+
+  recalc_indices();
+  return 1;
+}
+
 /**
  * Adds a given string to the TX queue.
  * @paran string given string
@@ -207,6 +265,7 @@ static enum hrtimer_restart handle_tx(struct hrtimer* timer)
   static int bit_index = -1;
   enum hrtimer_restart result = HRTIMER_NORESTART;
   bool must_restart_timer = false;
+  static int parity = 0;
   
   // Start bit.
   if (bit_index == -1)
@@ -215,6 +274,7 @@ static enum hrtimer_restart handle_tx(struct hrtimer* timer)
     {
       gpio_set_value(gpio_tx, 0);
       bit_index++;
+      parity = parity_init;
       must_restart_timer = true;
     }
   }
@@ -222,18 +282,37 @@ static enum hrtimer_restart handle_tx(struct hrtimer* timer)
   // Data bits.
   else if (0 <= bit_index && bit_index < 8)
   {
-    gpio_set_value(gpio_tx, 1 & (character >> bit_index));
+    int bit_value = 1 & (character >> bit_index);
+    gpio_set_value(gpio_tx, bit_value);
+    parity ^= bit_value;
+    bit_index++;
+    must_restart_timer = true;
+  }
+
+  // Parity bit (optional)
+  else if (bit_index == parity_index)
+  {
+    gpio_set_value(gpio_tx, parity);
     bit_index++;
     must_restart_timer = true;
   }
   
-  // Stop bit.
-  else if (bit_index == 8)
+  // Stop bit(s).
+  else if (bit_index <= final_stop_bit_index)
   {
     gpio_set_value(gpio_tx, 1);
-    character = 0;
-    bit_index = -1;
-    must_restart_timer = get_queue_size(&queue_tx) > 0;
+    if (bit_index == final_stop_bit_index)
+    {
+      character = 0;
+      bit_index = -1;
+      parity = 0;
+      must_restart_timer = get_queue_size(&queue_tx) > 0;
+    }
+    else
+    {
+      bit_index++;
+      must_restart_timer = true;
+    }
   }
   
   // Restarts the TX timer.
@@ -253,6 +332,8 @@ static enum hrtimer_restart handle_rx(struct hrtimer* timer)
 {
   ktime_t current_time = ktime_get();
   static unsigned int character = 0;
+  static int parity = 0;
+  static bool parity_ok = true;
   int bit_value = gpio_get_value(gpio_rx);
   enum hrtimer_restart result = HRTIMER_NORESTART;
   bool must_restart_timer = false;
@@ -262,6 +343,8 @@ static enum hrtimer_restart handle_rx(struct hrtimer* timer)
   {
     rx_bit_index++;
     character = 0;
+    parity = parity_init;
+    parity_ok = true;
     must_restart_timer = true;
   }
   
@@ -276,16 +359,38 @@ static enum hrtimer_restart handle_rx(struct hrtimer* timer)
     {
       character |= 0x0100;
     }
+    parity ^= bit_value;
     
     rx_bit_index++;
     character >>= 1;
     must_restart_timer = true;
   }
-  
-  // Stop bit.
-  else if (rx_bit_index == 8)
+
+  // Parity bit (optional)
+  else if (rx_bit_index == parity_index)
   {
-    receive_character(character);
+    if (bit_value != parity)
+    {
+      parity_ok = false;
+    }
+    rx_bit_index++;
+    must_restart_timer = true;
+  }
+
+  // Extra stop bit (optional)
+  else if (rx_bit_index < final_stop_bit_index)
+  {
+    rx_bit_index++;
+    must_restart_timer = true;
+  }
+  
+  // Final stop bit.
+  else if (rx_bit_index == final_stop_bit_index)
+  {
+    if (parity_ok || ignore_parity_errors)
+    {
+      receive_character(character);
+    }
     rx_bit_index = -1;
   }
   
